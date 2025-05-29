@@ -210,7 +210,7 @@ class Stripe extends PaymentBase
         string $sSuccessUrl,
         string $sErrorUrl,
         bool $bCustomerPresent,
-        Resource\Source $oSource = null
+        ?Resource\Source $oSource = null
     ): ChargeResponse {
 
         /** @var ChargeResponse $oChargeResponse */
@@ -338,7 +338,7 @@ class Stripe extends PaymentBase
         string $sDescription,
         Resource\Invoice $oInvoice,
         bool $bCustomerPresent,
-        Resource\Source $oSource = null
+        ?Resource\Source $oSource = null
     ): array {
 
         //  Get any meta data to pass along to Stripe
