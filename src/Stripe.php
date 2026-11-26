@@ -369,10 +369,11 @@ class Stripe extends PaymentBase
             'off_session'          => empty($bCustomerPresent),
 
             /**
-             * Card only. Without this, newer API versions enable automatic_payment_methods
-             * by default and reject a confirmed intent which has no return_url.
+             * Card only. `payment_method_types` was removed in API 2026-09-30.endive; payment
+             * methods are now managed from the Stripe Dashboard, and this restricts the intent
+             * to cards so a confirmed intent doesn't need a return_url.
              */
-            'payment_method_types' => ['card'],
+            'allowed_payment_method_types' => ['card'],
         ];
 
         /**
