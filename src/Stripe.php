@@ -28,12 +28,9 @@ use Nails\Invoice\Factory\ScaResponse;
 use Nails\Invoice\Resource;
 use Stripe\Account;
 use Stripe\BalanceTransaction;
+use Stripe\Charge;
 use Stripe\CountrySpec;
 use Stripe\Customer;
-use Stripe\Error\Api;
-use Stripe\Error\ApiConnection;
-use Stripe\Error\Card;
-use Stripe\Error\InvalidRequest;
 use Stripe\Exception\ApiConnectionException;
 use Stripe\Exception\ApiErrorException;
 use Stripe\Exception\CardException;
@@ -49,6 +46,16 @@ use stdClass;
  */
 class Stripe extends PaymentBase
 {
+    /**
+     * The Stripe API version the driver is written against. This is sent with every
+     * request so behaviour does not change when the stripe-php SDK (which defaults
+     * to the API version it was generated from) or the account's default is bumped.
+     * Only change this alongside a review of Stripe's changelog and a test pass.
+     *
+     * @link https://docs.stripe.com/changelog
+     */
+    const API_VERSION = '2026-10-28.endive';
+
     const PAYMENT_INTENT_STATUS_REQUIRES_CONFIRMATION   = 'requires_confirmation';
     const PAYMENT_INTENT_STATUS_REQUIRES_ACTION         = 'requires_action';
     const PAYMENT_INTENT_STATUS_REQUIRES_PAYMENT_METHOD = 'requires_payment_method';
@@ -106,13 +113,16 @@ class Stripe extends PaymentBase
             try {
 
                 $this->setApiKey();
-                $oAccount = Account::retrieve($this->getApiKey());
+                $oAccount = Account::retrieve();
                 $oCountry = CountrySpec::retrieve($oAccount->country);
 
                 self::$aSupportedCurrencies = array_map('strtoupper', $oCountry->supported_payment_currencies);
 
             } catch (Exception $e) {
-                //  @todo (Pablo - 2019-08-01) - shout about this?
+                //  Don't block checkout, but leave a trace; a null result means "all currencies"
+                Factory::service('Logger')->line(
+                    'Stripe: failed to fetch supported currencies: ' . $e->getMessage()
+                );
             }
         }
 
@@ -254,13 +264,12 @@ class Stripe extends PaymentBase
                 throw new DriverException('Invalid PaymentIntent status', 500);
             }
 
-            $oCharge             = reset($oPaymentIntent->charges->data);
-            $oBalanceTransaction = BalanceTransaction::retrieve($oCharge->balance_transaction);
+            $oCharge = $this->getLatestCharge($oPaymentIntent);
 
             $oChargeResponse
                 ->setStatusComplete()
                 ->setTransactionId($oCharge->id)
-                ->setFee($oBalanceTransaction->fee);
+                ->setFee($this->getFee($oCharge));
 
         } catch (ApiConnectionException $e) {
 
@@ -269,6 +278,18 @@ class Stripe extends PaymentBase
                 $e->getMessage(),
                 $e->getCode(),
                 'There was a problem connecting to the gateway, you may wish to try again.'
+            );
+
+        } catch (CardException $e) {
+
+            //  Card was declined. Work out why. (Must precede ApiErrorException, which it extends)
+            $aJsonBody = $e->getJsonBody();
+            $aError    = $aJsonBody['error'] ?? [];
+
+            $oChargeResponse->setStatusFailed(
+                $e->getMessage(),
+                $e->getCode(),
+                'The payment card was declined. ' . ($aError['message'] ?? $e->getMessage())
             );
 
         } catch (InvalidRequestException $e) {
@@ -287,18 +308,6 @@ class Stripe extends PaymentBase
                 $e->getMessage(),
                 $e->getCode(),
                 'There was a problem connecting to the gateway, you may wish to try again.'
-            );
-
-        } catch (CardException $e) {
-
-            //  Card was declined. Work out why.
-            $aJsonBody = $e->getJsonBody();
-            $aError    = $aJsonBody['error'];
-
-            $oChargeResponse->setStatusFailed(
-                $e->getMessage(),
-                $e->getCode(),
-                'The payment card was declined. ' . $aError['message']
             );
 
         } catch (Exception $e) {
@@ -344,9 +353,11 @@ class Stripe extends PaymentBase
         //  Get any meta data to pass along to Stripe
         $aMetaData = $this->extractMetaData($oInvoice, $oPaymentData);
 
-        //  Prep the statement descriptor
-        $sStatementDescriptor = $this->getSetting('sStatementDescriptor');
+        //  Prep the statement descriptor suffix. Stripe disallows < > \ ' " * and caps it at 22 characters
+        $sStatementDescriptor = (string) $this->getSetting('sStatementDescriptor');
         $sStatementDescriptor = str_replace('{{INVOICE_REF}}', $oInvoice->ref, $sStatementDescriptor);
+        $sStatementDescriptor = preg_replace('/[<>\\\\\'"*]/', '', $sStatementDescriptor);
+        $sStatementDescriptor = trim(substr($sStatementDescriptor, 0, 22));
 
         $aRequestData = [
             'amount'               => $iAmount,
@@ -356,8 +367,21 @@ class Stripe extends PaymentBase
             'description'          => $sDescription,
             'metadata'             => $aMetaData,
             'off_session'          => empty($bCustomerPresent),
-            'statement_descriptor' => substr($sStatementDescriptor, 0, 22),
+
+            /**
+             * Card only. Without this, newer API versions enable automatic_payment_methods
+             * by default and reject a confirmed intent which has no return_url.
+             */
+            'payment_method_types' => ['card'],
         ];
+
+        /**
+         * `statement_descriptor` is rejected for card payments; the suffix is appended
+         * to the prefix configured on the Stripe account.
+         */
+        if (!empty($sStatementDescriptor)) {
+            $aRequestData['statement_descriptor_suffix'] = $sStatementDescriptor;
+        }
 
         if ($this->getSetting('bEnableStripeReceiptEmail')) {
             if (!empty($oInvoice->customer->billing_email)) {
@@ -560,20 +584,69 @@ class Stripe extends PaymentBase
     protected function scaComplete(
         ScaResponse $oScaResponse, PaymentIntent $oPaymentIntent
     ): ScaResponse {
-        $oCharge = reset($oPaymentIntent->charges->data);
-        if (empty($oCharge)) {
-            throw new DriverException('No charges detected. Payment was not processed.');
-        }
-
-        //  Get the balance transaction
-        $oBalanceTransaction = BalanceTransaction::retrieve($oCharge->balance_transaction);
+        $oCharge = $this->getLatestCharge($oPaymentIntent);
 
         $oScaResponse
             ->setStatusComplete()
             ->setTransactionId($oCharge->id)
-            ->setFee($oBalanceTransaction->fee);
+            ->setFee($this->getFee($oCharge));
 
         return $oScaResponse;
+    }
+
+    // --------------------------------------------------------------------------
+
+    /**
+     * Returns the Charge created by a PaymentIntent, with its balance transaction
+     * expanded. (`PaymentIntent::$charges` no longer exists; `latest_charge` is an ID
+     * unless expanded.)
+     *
+     * @param PaymentIntent $oPaymentIntent The Payment Intent object
+     *
+     * @return Charge
+     * @throws DriverException
+     * @throws ApiErrorException
+     */
+    protected function getLatestCharge(PaymentIntent $oPaymentIntent): Charge
+    {
+        $mCharge = $oPaymentIntent->latest_charge ?? null;
+        if (empty($mCharge)) {
+            throw new DriverException('No charges detected. Payment was not processed.');
+        }
+
+        if ($mCharge instanceof Charge) {
+            return $mCharge;
+        }
+
+        return Charge::retrieve([
+            'id'     => $mCharge,
+            'expand' => ['balance_transaction'],
+        ]);
+    }
+
+    // --------------------------------------------------------------------------
+
+    /**
+     * Returns the fee Stripe took for a Charge
+     *
+     * @param Charge $oCharge The Charge object
+     *
+     * @return int
+     * @throws DriverException
+     * @throws ApiErrorException
+     */
+    protected function getFee(Charge $oCharge): int
+    {
+        $mBalanceTransaction = $oCharge->balance_transaction ?? null;
+        if (empty($mBalanceTransaction)) {
+            throw new DriverException('Charge "' . $oCharge->id . '" has no balance transaction.');
+        }
+
+        if (!$mBalanceTransaction instanceof BalanceTransaction) {
+            $mBalanceTransaction = BalanceTransaction::retrieve($mBalanceTransaction);
+        }
+
+        return (int) $mBalanceTransaction->fee;
     }
 
     // --------------------------------------------------------------------------
@@ -697,13 +770,14 @@ class Stripe extends PaymentBase
     // --------------------------------------------------------------------------
 
     /**
-     * Set the appropriate API Key to use
+     * Set the appropriate API Key and API version to use
      *
      * @throws DriverException
      */
     protected function setApiKey(): void
     {
         \Stripe\Stripe::setApiKey($this->getApiKey());
+        \Stripe\Stripe::setApiVersion(static::API_VERSION);
     }
 
     // --------------------------------------------------------------------------
