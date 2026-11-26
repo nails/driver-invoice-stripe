@@ -374,6 +374,13 @@ class Stripe extends PaymentBase
              * to cards so a confirmed intent doesn't need a return_url.
              */
             'allowed_payment_method_types' => ['card'],
+
+            /**
+             * The default is now `automatic_async`, which captures after the response returns
+             * and so leaves the charge without a balance transaction (and fee) at this point.
+             * We need the fee straight away, so capture synchronously as before.
+             */
+            'capture_method'               => 'automatic',
         ];
 
         /**
@@ -628,19 +635,25 @@ class Stripe extends PaymentBase
     // --------------------------------------------------------------------------
 
     /**
-     * Returns the fee Stripe took for a Charge
+     * Returns the fee Stripe took for a Charge, or 0 if it isn't available yet
      *
      * @param Charge $oCharge The Charge object
      *
      * @return int
-     * @throws DriverException
      * @throws ApiErrorException
      */
     protected function getFee(Charge $oCharge): int
     {
         $mBalanceTransaction = $oCharge->balance_transaction ?? null;
         if (empty($mBalanceTransaction)) {
-            throw new DriverException('Charge "' . $oCharge->id . '" has no balance transaction.');
+            /**
+             * The customer has already been charged, so don't fail the payment over a missing
+             * fee; that would invite a second charge. Leave a trace so it can be reconciled.
+             */
+            Factory::service('Logger')->line(
+                'Stripe: charge "' . $oCharge->id . '" has no balance transaction; recording a fee of 0'
+            );
+            return 0;
         }
 
         if (!$mBalanceTransaction instanceof BalanceTransaction) {
