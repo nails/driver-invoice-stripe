@@ -67,7 +67,7 @@ class Stripe implements Interfaces\Component\Settings
         $oStatementDescriptor
             ->setKey(static::KEY_STATEMENT_DESCRIPTOR)
             ->setLabel('Statement Descriptor')
-            ->setInfo('The text shown on the customer\'s statement. You can sub in <code>{{INVOICE_REF}}</code> for the invoice reference.')
+            ->setInfo('The text shown on the customer\'s statement, sent to Stripe as the card statement descriptor suffix and appended to the prefix set on your Stripe account. You can sub in <code>{{INVOICE_REF}}</code> for the invoice reference.')
             ->setDefault('INV #{{INVOICE_REF}}')
             ->setMaxLength(22)
             ->setValidation([
