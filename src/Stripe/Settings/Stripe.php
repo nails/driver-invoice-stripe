@@ -2,6 +2,7 @@
 
 namespace Nails\Invoice\Driver\Payment\Stripe\Settings;
 
+use Nails\Invoice\Driver\Payment\Stripe\Admin\Permission;
 use Nails\Common\Helper\Form;
 use Nails\Common\Interfaces;
 use Nails\Common\Service\FormValidation;
@@ -39,9 +40,9 @@ class Stripe implements Interfaces\Component\Settings
     /**
      * @inheritDoc
      */
-    public function getPermissions(): array
+    public function getPermission(): string
     {
-        return [];
+        return Permission\Settings\Stripe::class;
     }
 
     // --------------------------------------------------------------------------
